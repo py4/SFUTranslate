@@ -22,7 +22,8 @@ from translate.learning.modules.rnn.decoder import DecoderRNN
 from translate.learning.modules.rnn.encoder import EncoderRNN
 from typing import List, Any, Tuple, Dict
 
-from translate.backend.utils import backend, list_to_long_tensor, device, zeros_tensor, row_wise_batch_copy
+from translate.backend.utils import backend, list_to_long_tensor, device, zeros_tensor, zeros_vector, \
+    row_wise_batch_copy, Variable
 from translate.configs.loader import ConfigLoader
 from translate.learning.modelling import AbsCompleteModel
 from translate.learning.modules.mlp.generator import GeneratorNN
@@ -58,6 +59,12 @@ class SequenceToSequence(AbsCompleteModel):
         init_val = configs.get("trainer.model.init_val", 0.01)
         self.batch_size = configs.get("trainer.model.bsize", must_exist=True)
         decoder_weight_tying = configs.get("trainer.model.decoder_weight_tying", False)
+
+        self.use_bag_of_words_loss = configs.get("trainer.model.use_bag_of_words_loss", False)
+        if self.use_bag_of_words_loss is True:
+            weight = backend.ones(len(self.dataset.target_vocabulary))
+            weight[0] = 0
+            self.multi_label_loss = backend.nn.MultiLabelSoftMarginLoss(weight=weight, size_average=False)
 
         self.beam_size = configs.get("trainer.model.beam_size", 1)
         assert self.beam_size >= 1
@@ -113,7 +120,7 @@ class SequenceToSequence(AbsCompleteModel):
         return self.greedy_decode(encoder_outputs, encoder_hidden_params, target_variable)
 
     def greedy_decode(self, encoder_outputs: backend.Tensor, encoder_hidden_params: Tuple[backend.Tensor],
-                      target_variable: backend.Tensor=None):
+                      target_variable: backend.Tensor = None):
         """
         :param encoder_outputs: 3-D Tensor [max_length (might vary per batch), batch_size, hidden_size]
         :param encoder_hidden_params: Pair of size 2 of 3-D Tensors
@@ -136,10 +143,16 @@ class SequenceToSequence(AbsCompleteModel):
         result = GreedyDecodingResult(batch_size, self.pad_token_id, self.eos_token_id)
         loss = zeros_tensor(1, 1, 1).view(-1)
         target_length = 0
+
+        if self.use_bag_of_words_loss:
+            sentence_level_scores = zeros_vector(batch_size, len(self.dataset.target_vocabulary))
+
         while not result.decoding_completed and target_length < 2 * expected_target_length:
             decoder_output, decoder_hidden_params, decoder_attention = \
                 self.decoder(decoder_input, decoder_hidden_params, h_hat, encoder_outputs, batch_size=batch_size)
             h_hat = decoder_output
+            if self.use_bag_of_words_loss:
+                sentence_level_scores += self.generator.out(decoder_output)
             decoder_output = self.generator(decoder_output)
             if target_variable is not None:
                 di = target_length if target_length < expected_target_length \
@@ -151,13 +164,35 @@ class SequenceToSequence(AbsCompleteModel):
             else:
                 decoder_input = next_decoder_input
             target_length += 1
+
+        if self.use_bag_of_words_loss:
+            bag_of_words_loss = zeros_tensor(1, 1, 1).view(-1)
+            normalized_sentence_level_scores = backend.nn.LogSigmoid()(sentence_level_scores)
+            temp_target_variable = target_variable.clone().t()
+            for sentence_index in range(temp_target_variable.size()[0]):
+                seen_tokens = set()
+                for token_index in range(temp_target_variable.size()[1]):
+                    if temp_target_variable[sentence_index][token_index] in seen_tokens:
+                        temp_target_variable[sentence_index][token_index] = self.dataset.target_vocabulary.get_pad_word_index()
+                    else:
+                        seen_tokens.add(temp_target_variable[sentence_index][token_index])
+
+            temp_target_variable = temp_target_variable.t()
+
+            # temp target variable: 49 x 64
+            # normalized sentence level scores:  64 x 101
+            for i in range(target_variable.size()[0]):
+                bag_of_words_loss += self.criterion(normalized_sentence_level_scores, temp_target_variable[i])
+
+            loss = (loss, bag_of_words_loss)
+
         if target_variable is not None:
             return loss, target_length, result.ids
         else:
             return result.log_probability, target_length, result.ids
 
     def beam_search_decode(self, encoder_outputs: backend.Tensor, encoder_hidden_params: Tuple[backend.Tensor],
-                           target_variable: backend.Tensor=None, k: int=1):
+                           target_variable: backend.Tensor = None, k: int = 1):
         """
         :param encoder_outputs: 3-D Tensor [max_length (might vary per batch), batch_size, hidden_size]
         :param encoder_hidden_params: Pair of size 2 of 3-D Tensors
@@ -195,8 +230,9 @@ class SequenceToSequence(AbsCompleteModel):
                 loss += self.criterion(generator_output, row_wise_batch_copy(target_variable[di], k))
             next_decoder_input, selection_bucket = result.append(*generator_output.data.topk(k))
             h_hat = backend.stack([decoder_output[ind] for ind in selection_bucket], dim=0)
-            decoder_hidden_params = (backend.stack([decoder_hidden_params[0][:, ind] for ind in selection_bucket], dim=1),
-                                     backend.stack([decoder_hidden_params[1][:, ind] for ind in selection_bucket], dim=1))
+            decoder_hidden_params = (
+            backend.stack([decoder_hidden_params[0][:, ind] for ind in selection_bucket], dim=1),
+            backend.stack([decoder_hidden_params[1][:, ind] for ind in selection_bucket], dim=1))
             if random.random() < self.teacher_forcing_ratio and target_variable is not None:
                 decoder_input = row_wise_batch_copy(target_variable[di], k)  # Teacher forcing
             else:
@@ -220,12 +256,14 @@ class SequenceToSequence(AbsCompleteModel):
         with backend.no_grad():
             encoder_outputs, encoder_hidden_params = self.encode(source_tensor)
             if self.beam_size == 1:
-                log_prob, target_length, predicted_ids = self.greedy_decode(encoder_outputs, encoder_hidden_params,None)
+                log_prob, target_length, predicted_ids = self.greedy_decode(encoder_outputs, encoder_hidden_params,
+                                                                            None)
             else:
                 log_prob, target_length, predicted_ids = self.beam_search_decode(encoder_outputs, encoder_hidden_params,
                                                                                  None, self.beam_size)
         bleu_score, ref_sample, hyp_sample = self.dataset.compute_bleu(
-            reference_tensor, predicted_ids, ref_is_tensor=True, reader_level=self.dataset.get_target_word_granularity())
+            reference_tensor, predicted_ids, ref_is_tensor=True,
+            reader_level=self.dataset.get_target_word_granularity())
         result_sample = u"E=\"{}\", P=\"{}\"\n".format(ref_sample, hyp_sample)
         return bleu_score, log_prob, result_sample
 
@@ -235,5 +273,4 @@ class SequenceToSequence(AbsCompleteModel):
         """
         if self.auto_teacher_forcing_ratio:
             self.teacher_forcing_ratio = 1.001 - (
-                float(args["epoch"] * (1. - self.min_teacher_forcing_ratio)) / args["total"]) ** 2
-
+                    float(args["epoch"] * (1. - self.min_teacher_forcing_ratio)) / args["total"]) ** 2

@@ -245,13 +245,19 @@ class Estimator:
             self.scheduler_name = None
             self.schedulers = []
 
+        self.use_bag_of_words_loss = configs.get("trainer.model.use_bag_of_words_loss", False)
+        if self.use_bag_of_words_loss is True:
+            self.bag_of_words_loss_lambda = configs.get("trainer.model.bag_of_words_loss_lambda", must_exist=True)
+            self.bag_of_words_loss_k = configs.get("trainer.model.bag_of_words_loss_k", must_exist=True)
+            self.bag_of_words_loss_alpha = configs.get("trainer.model.bag_of_words_loss_alpha", must_exist=True)
+
     def step_schedulers(self):
         if len(self.schedulers):
             logger.info("Updating the learning rates through {} scheduler ...".format(self.scheduler_name))
         for scheduler in self.schedulers:
             scheduler.step()
 
-    def step(self, *args, **kwargs) -> Tuple[float, List[List[int]]]:
+    def step(self, epoch, *args, **kwargs) -> Tuple[float, List[List[int]]]:
         """
         The step function which takes care of computing the loss, gradients and back-propagating them given
          the input tensors (the number of them could vary based on the application).
@@ -260,6 +266,12 @@ class Estimator:
         for opt in self.optimizers:
             opt.zero_grad()
         _loss_, _loss_size_, computed_output = self.model.forward(*args, *kwargs)
+
+        if self.use_bag_of_words_loss:
+            mle_loss, bag_of_words_loss = _loss_
+            current_lambda = min(self.bag_of_words_loss_lambda, self.bag_of_words_loss_k + self.bag_of_words_loss_alpha * epoch)
+            _loss_ = mle_loss + current_lambda * bag_of_words_loss
+
         _loss_.backward()
         if self.grad_clip_norm > 0.0:
             [backend.nn.utils.clip_grad_norm_(x, self.grad_clip_norm) for x in self.model.optimizable_params_list()]
@@ -268,7 +280,7 @@ class Estimator:
             opt.step()
         return loss_value, computed_output
 
-    def step_no_grad(self, *args, **kwargs):
+    def step_no_grad(self, epoch, *args, **kwargs):
         """
         The function which given a pair of input tensors, freezes the model parameters then computes the model loss over
          its predictions.
@@ -276,6 +288,12 @@ class Estimator:
         """
         with backend.no_grad():
             _loss_, _loss_size_, computed_output = self.model.forward(*args, *kwargs)
+
+            if self.use_bag_of_words_loss:
+                mle_loss, bag_of_words_loss = _loss_
+                current_lambda = min(self.bag_of_words_loss_lambda, self.bag_of_words_loss_k + self.bag_of_words_loss_alpha * epoch)
+                _loss_ = mle_loss + current_lambda * bag_of_words_loss
+
             loss_value = _loss_.item() / _loss_size_ if _loss_size_ > 0.0 else 0.0
             return loss_value, computed_output
 

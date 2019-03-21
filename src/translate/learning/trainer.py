@@ -125,7 +125,7 @@ if __name__ == '__main__':
         # dev.set_iter_log_handler(itr_handler.set_description)
         for train_batch in itr_handler:
             stat_collector.step()
-            loss_value, decoded_word_ids = estimator.step(*train_batch)
+            loss_value, decoded_word_ids = estimator.step(epoch, *train_batch)
             stat_collector.update(1.0, loss_value, train.reader_type)
             itr_handler.set_description("[E {}/{}]-[B {}]-[TL {:.3f} DL {:.3f} DS {:.3f}]-#Batches Processed"
                                         .format(epoch + 1, epochs, model.batch_size, stat_collector.train_loss,

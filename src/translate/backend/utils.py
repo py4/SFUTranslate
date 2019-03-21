@@ -7,6 +7,7 @@ This script contains any conversion functions which are necessary for limiting t
  the torch library itself
 """
 import torch as backend
+from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 
@@ -17,6 +18,10 @@ __author__ = "Hassan S. Shavarani"
 
 def zeros_tensor(d1, d2, d3):
     return backend.zeros(d1, d2, d3).to(device)
+
+
+def zeros_vector(d1, d2):
+    return backend.zeros(d1, d2).to(device)
 
 
 def list_to_long_tensor(list_long_values):
